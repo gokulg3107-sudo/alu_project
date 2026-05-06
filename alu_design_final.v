@@ -1,3 +1,4 @@
+
 module alu_design #(parameter size = 4, size_cmd = 4)(clk, rst, ce, inp_valid, mode, cmd, opa, opb, cin, err, res, oflow, cout, g, l, e);
 input clk, rst, ce, cin, mode;
 
@@ -16,241 +17,230 @@ reg [2 * size - 1: 0] temp;
 reg [size - 1: 0] temp_opa, temp_opb;
 reg temp_err;
 
+// ─── Stage-1 intermediate registers (computed at posedge 0) ───────────────
+reg [2 * size - 1: 0] res_s1;
+reg                    err_s1, oflow_s1, g_s1, l_s1, e_s1;
+// ─────────────────────────────────────────────────────────────────────────
+
+// cout is combinational off the FINAL registered res/err
+// so it naturally reflects posedge-1 outputs with no extra work
 assign cout = (err) ? 1'b0 :
               (mode) ? ((cmd == 0 || cmd == 2) ? res[size] : 1'b0)
                      : 1'b0;
-always@(*)begin
-        case(cmd)
-                1: oflow = (opa < opb) & mode;
-                3: oflow = ((opa < opb) | (opa == opb & cin == 1)) & mode;
-                default: oflow = 1'b0;
+
+// =========================================================================
+// STAGE 2 : final output registers — capture stage-1 values at posedge 1
+//           (multiply bypasses stage-1 and writes directly here)
+// =========================================================================
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        res          <= {2*size{1'b0}};
+        {err,g,l,e}  <= 4'd0;
+        oflow        <= 1'b0;
+    end else begin
+        // Multiply (cmd 9/10) writes directly to final outputs at count==2
+        // All other operations: just pipeline stage-1 → final output
+        if ((cmd == 9 || cmd == 10) && mode) begin
+            // handled inside the stage-1 block below via temp mechanism
+            // stage-2 just passes through what stage-1 computed for multiply
+            res         <= res_s1;
+            err         <= err_s1;
+            oflow       <= 1'b0;
+            {g, l, e}   <= {g_s1, l_s1, e_s1};
+        end else begin
+            res         <= res_s1;
+            err         <= err_s1;
+            oflow       <= oflow_s1;
+            {g, l, e}   <= {g_s1, l_s1, e_s1};
+        end
+    end
+end
+
+// =========================================================================
+// STAGE 1 : compute at posedge 0, results go into _s1 registers
+//           Multiply still uses temp + count for multi-cycle result
+// =========================================================================
+
+// count logic (unchanged)
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        count <= 2'd0;
+    end else begin
+        if (cmd == 9 || cmd == 10) begin
+            if (count == 2'd2) count <= 0;
+            else               count <= count + 1;
+        end else count <= 0;
+    end
+end
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        res_s1          <= {2*size{1'b0}};
+        {err_s1, g_s1, l_s1, e_s1} <= 4'd0;
+        oflow_s1        <= 1'b0;
+        temp            <= 0;
+        temp_opa        <= 0;
+        temp_opb        <= 0;
+        temp_err        <= 0;
+    end
+    else if (mode) begin
+        // For multiply (cmd 9/10), do NOT apply defaults during count=0/1
+        // because err_s1 is only valid at count=2 (driven from temp_err).
+        // Applying err_s1<=0 at count=0/1 would corrupt stage-2 one cycle too early.
+        if (cmd != 9 && cmd != 10) begin
+            err_s1   <= 1'b0;
+            oflow_s1 <= 1'b0;
+            {g_s1, l_s1, e_s1} <= 3'd0;
+        end
+
+        case (cmd)
+            0: begin
+                if (inp_valid == 2'b11) res_s1 <= opa + opb;
+                else                    err_s1 <= 1'b1;
+            end
+            1: begin
+                if (inp_valid == 2'b11) begin
+                    res_s1   <= opa - opb;
+                    oflow_s1 <= (opa < opb);
+                end else err_s1 <= 1'b1;
+            end
+            2: begin
+                if (inp_valid == 2'b11) res_s1 <= opa + opb + cin;
+                else                    err_s1 <= 1'b1;
+            end
+            3: begin
+                if (inp_valid == 2'b11) begin
+                    res_s1   <= opa - opb - cin;
+                    oflow_s1 <= ((opa < opb) | (opa == opb & cin == 1));
+                end else err_s1 <= 1'b1;
+            end
+            4: begin
+                if (inp_valid[0] == 1'b1) res_s1 <= opa + 1'b1;
+                else                      err_s1 <= 1'b1;
+            end
+            5: begin
+                if (inp_valid[0] == 1'b1) res_s1 <= opa - 1'b1;
+                else                      err_s1 <= 1'b1;
+            end
+            6: begin
+                if (inp_valid[1] == 1'b1) res_s1 <= opb + 1'b1;
+                else                      err_s1 <= 1'b1;
+            end
+            7: begin
+                if (inp_valid[1] == 1'b1) res_s1 <= opb - 1'b1;
+                else                      err_s1 <= 1'b1;
+            end
+            8: begin
+                res_s1 <= 0;
+                if (inp_valid == 2'b11) begin
+                    if      (opa == opb) {g_s1, l_s1, e_s1} <= 3'b001;
+                    else if (opa >  opb) {g_s1, l_s1, e_s1} <= 3'b100;
+                    else                 {g_s1, l_s1, e_s1} <= 3'b010;
+                end else err_s1 <= 1'b1;
+            end
+
+            // ── Multiply cmd 9: (opa+1)*(opb+1), 2-cycle latency ────────
+            // Inputs @ posedge N (count=0) → res_s1 updated @ posedge N+2 (count=2)
+            // Final res updates @ posedge N+3 via stage-2 pipeline
+            // NOTE: if you want multiply result at posedge N+2, remove stage-2
+            //       pass-through for cmd 9/10 and write directly to res in stage-1
+            9: begin
+                if (count == 0) begin
+                    if (inp_valid == 2'b11) begin
+                        temp_opa <= opa;
+                        temp_opb <= opb;
+                        temp_err <= 1'b0;
+                    end else temp_err <= 1'b1;
+                end
+                else if (count == 1) begin
+                    temp <= (temp_opa + 1) * (temp_opb + 1);
+                end
+                else if (count == 2) begin
+                    res_s1  <= temp;
+                    err_s1  <= temp_err;
+                    // pipeline next input immediately
+                    if (inp_valid == 2'b11) begin
+                        temp_opa <= opa;
+                        temp_opb <= opb;
+                        temp_err <= 1'b0;
+                    end else temp_err <= 1'b1;
+                end
+            end
+
+            // ── Multiply cmd 10: (opa<<1)*opb, 2-cycle latency ──────────
+            10: begin
+                if (count == 0) begin
+                    if (inp_valid == 2'b11) begin
+                        temp_opa <= opa;
+                        temp_opb <= opb;
+                        temp_err <= 1'b0;
+                    end else temp_err <= 1'b1;
+                end
+                else if (count == 1) begin
+                    temp <= (temp_opa << 1) * temp_opb;
+                end
+                else if (count == 2) begin
+                    res_s1 <= temp;
+                    err_s1 <= temp_err;
+                    if (inp_valid == 2'b11) begin
+                        temp_opa <= opa;
+                        temp_opb <= opb;
+                        temp_err <= 1'b0;
+                    end else temp_err <= 1'b1;
+                end
+            end
+
+            11: begin
+                if (inp_valid == 2'b11) begin
+                    res_s1 <= $signed(opa) + $signed(opb);
+                    if      ($signed(opa) == $signed(opb)) {g_s1,l_s1,e_s1} <= 3'b001;
+                    else if ($signed(opa) >  $signed(opb)) {g_s1,l_s1,e_s1} <= 3'b100;
+                    else                                    {g_s1,l_s1,e_s1} <= 3'b010;
+                end else err_s1 <= 1'b1;
+            end
+            12: begin
+                if (inp_valid == 2'b11) begin
+                    res_s1 <= $signed(opa) - $signed(opb);
+                    if      ($signed(opa) == $signed(opb)) {g_s1,l_s1,e_s1} <= 3'b001;
+                    else if ($signed(opa) >  $signed(opb)) {g_s1,l_s1,e_s1} <= 3'b100;
+                    else                                    {g_s1,l_s1,e_s1} <= 3'b010;
+                end else err_s1 <= 1'b1;
+            end
         endcase
+    end
+
+    else begin  // logic mode
+        err_s1   <= 1'b0;
+        oflow_s1 <= 1'b0;
+        {g_s1, l_s1, e_s1} <= 3'd0;
+
+        case (cmd)
+            0:  begin if (inp_valid == 2'b11) res_s1 <= {{size{1'b0}}, opa & opb};    else err_s1 <= 1'b1; end
+            1:  begin if (inp_valid == 2'b11) res_s1 <= {{size{1'b0}}, ~(opa & opb)}; else err_s1 <= 1'b1; end
+            2:  begin if (inp_valid == 2'b11) res_s1 <= {{size{1'b0}}, opa | opb};    else err_s1 <= 1'b1; end
+            3:  begin if (inp_valid == 2'b11) res_s1 <= {{size{1'b0}}, ~(opa | opb)}; else err_s1 <= 1'b1; end
+            4:  begin if (inp_valid == 2'b11) res_s1 <= {{size{1'b0}}, opa ^ opb};    else err_s1 <= 1'b1; end
+            5:  begin if (inp_valid == 2'b11) res_s1 <= {{size{1'b0}}, opa ~^ opb};   else err_s1 <= 1'b1; end
+            6:  begin if (inp_valid[0] == 1'b1) res_s1 <= {{size{1'b0}}, ~opa};       else err_s1 <= 1'b1; end
+            7:  begin if (inp_valid[1] == 1'b1) res_s1 <= {{size{1'b0}}, ~opb};       else err_s1 <= 1'b1; end
+            8:  begin if (inp_valid[0] == 1'b1) res_s1 <= {{size{1'b0}}, opa >> 1};   else err_s1 <= 1'b1; end
+            9:  begin if (inp_valid[1] == 1'b1) res_s1 <= {{size{1'b0}}, opa << 1};   else err_s1 <= 1'b1; end
+            10: begin if (inp_valid[0] == 1'b1) res_s1 <= {{size{1'b0}}, opb >> 1};   else err_s1 <= 1'b1; end
+            11: begin if (inp_valid[1] == 1'b1) res_s1 <= {{size{1'b0}}, opb << 1};   else err_s1 <= 1'b1; end
+            12: begin
+                if (inp_valid == 2'b11) begin
+                    if (|opb[size-1:3]) err_s1 <= 1'b1;
+                    else res_s1 <= {{size{1'b0}}, opa << (opb[size/2 - 1 : 0])};
+                end else err_s1 <= 1'b1;
+            end
+            13: begin
+                if (inp_valid == 2'b11) begin
+                    if (|opb[size-1:3]) err_s1 <= 1'b1;
+                    else res_s1 <= {{size{1'b0}}, opa >> (opb[size/2 - 1 : 0])};
+                     end else err_s1 <= 1'b1;
+            end
+        endcase
+    end
 end
 
-always @(posedge clk or posedge rst)begin
-        if(rst)begin
-                count <= 2'd0;
-        end
-        else begin
-                if (cmd == 9 | cmd == 10)begin
-                        if (count == 2'd2) count <= 0;
-                        else count <= count + 1;
-                end
-                else count <= 0;
-        end
-end
-
-always @(posedge clk or posedge rst)begin
-        if(rst) begin
-                res <= {2 * size{1'b0}};
-                {err, g, l, e} <= 4'd0;
-        end
-        else if(mode) begin
-                err <= 1'b0;
-                {g, l, e} <= 3'd0;
-                case(cmd)
-                0: begin
-                        if(inp_valid == 2'b11)
-                                res <= opa + opb;
-                        else err <= 1'b1;
-                end
-                1: begin
-                        if(inp_valid == 2'b11)
-                                res <= opa - opb;
-                        else err <= 1'b1;
-                end
-                2: begin
-                        if(inp_valid == 2'b11)
-                                res <= opa + opb + cin;
-                        else err <= 1'b1;
-                end
-                3: begin
-                        if(inp_valid == 2'b11)
-                                res <= opa - opb - cin;
-                        else err <= 1'b1;
-                end
-                4: begin
-                        if(inp_valid[0] == 1'b1) res <= opa + 1'b1;
-                        else err <= 1'b1;
-                end
-                5: begin
-                        if(inp_valid[0] == 1'b1) res <= opa - 1'b1;
-                        else err <= 1'b1;
-                end
-                6: begin
-                        if(inp_valid[1] == 1'b1) res <= opb + 1'b1;
-                        else err <= 1'b1;
-                end
-                7: begin
-                        if(inp_valid[1] == 1'b1) res <= opb - 1'b1;
-                        else err <= 1'b1;
-                end
-                8: begin
-                        res <= 0;
-                        if(inp_valid == 2'b11)begin
-                                if (opa == opb) {g, l, e} <= 3'b001;
-                                else if (opa > opb) {g, l, e} <= 3'b100;
-                                else {g, l, e} <= 3'b010;
-                        end
-                        else err <= 1'b1;
-                end
-                9: begin
-                        if(count == 0) begin
-                                if(inp_valid == 2'b11) begin
-                                    temp     <= (opa + 1) * (opb + 1);
-                                    temp_opa <= opa; // capture for pipelining if needed
-                                    temp_err <= 1'b0;
-                                end
-                                else
-                                    temp_err <= 1'b1;
-                        end
-                        else if(count == 1) begin
-                        end
-                        else if(count == 2) begin
-                                err <= temp_err;
-                                res <= temp;
-                                if(inp_valid == 2'b11) begin
-                                    temp     <= (opa + 1) * (opb + 1);
-                                    temp_opa <= opa;
-                                    temp_err <= 1'b0;
-                                end
-                                else temp_err <= 1'b1;
-                        end
-                end
-
-                10: begin
-                        if(count == 0) begin
-                                if(inp_valid == 2'b11) begin
-                                        temp     <= (opa << 1) * opb;
-                                        temp_err <= 1'b0;
-                                end
-                                else temp_err <= 1'b1;
-                        end
-                        else if(count == 1) begin
-                        end
-                        else if(count == 2) begin
-                                err <= temp_err;
-                                res <= temp;
-
-                                if(inp_valid == 2'b11) begin
-                                        temp     <= (opa << 1) * opb;
-                                        temp_err <= 1'b0;
-                                end
-                                else temp_err <= 1'b1;
-                        end
-                end
-                11: begin
-                        if(inp_valid == 2'b11) begin
-                                res <= $signed(opa) + $signed(opb);
-                                if ($signed(opa) == $signed(opb))      {g,l,e} <= 3'b001;
-                                else if ($signed(opa) > $signed(opb))  {g,l,e} <= 3'b100;
-                                else                                    {g,l,e} <= 3'b010;
-                        end
-                        else err <= 1;
-                end
-                12: begin
-                        if(inp_valid == 2'b11) begin
-                                res <= $signed(opa) - $signed(opb);
-                                if ($signed(opa) == $signed(opb))      {g,l,e} <= 3'b001;
-                                else if ($signed(opa) > $signed(opb))  {g,l,e} <= 3'b100;
-                                else                                    {g,l,e} <= 3'b010;
-                        end
-                        else err <= 1;
-                end
-                endcase
-        end
-
-        else begin
-                err <= 1'b0;
-                {g, l, e} <= 3'd0;
-                case(cmd)
-                0: begin
-                        if(inp_valid == 2'b11) res <= {{size{1'b0}}, opa & opb};
-                        else err <= 1'b1;
-                end
-                1: begin
-                        if(inp_valid == 2'b11) res <= {{size{1'b0}}, ~(opa & opb)};
-                        else err <= 1'b1;
-                end
-                2: begin
-                        if(inp_valid == 2'b11) res <= {{size{1'b0}}, (opa | opb)};
-                        else err <= 1'b1;
-                end
-                3: begin
-                        if(inp_valid == 2'b11) res <= {{size{1'b0}}, ~(opa | opb)};
-                        else err <= 1'b1;
-                end
-                4: begin
-                        if(inp_valid == 2'b11) res <= {{size{1'b0}}, (opa ^ opb)};
-                        else err <= 1'b1;
-                end
-                5: begin
-                        if(inp_valid == 2'b11) res <= {{size{1'b0}}, (opa ~^ opb)};
-                        else err <= 1'b1;
-                end
-                6: begin
-                        if(inp_valid[0] == 1'b1) res <= {{size{1'b0}}, (~opa)};
-                        else err <= 1'b1;
-                end
-                7: begin
-                        if(inp_valid[1] == 1'b1) res <= {{size{1'b0}}, (~opb)};
-                        else err <= 1'b1;
-                end
-                8: begin
-                        if(inp_valid[0] == 1'b1) res <= {{size{1'b0}}, (opa >> 1)};
-                        else err <= 1'b1;
-                end
-                9: begin
-                        if(inp_valid[1] == 1'b1) res <= {{size{1'b0}}, (opa << 1)};
-                        else err <= 1'b1;
-                end
-                10: begin
-                        if(inp_valid[0] == 1'b1) res <= {{size{1'b0}}, (opb >> 1)};
-                        else err <= 1'b1;
-                end
-                11: begin
-                        if(inp_valid[1] == 1'b1) res <= {{size{1'b0}}, (opb << 1)};
-                        else err <= 1'b1;
-                end
-                12: begin
-                        if(inp_valid == 2'b11)begin
-                                if (|opb[size-1:3]) err <= 1;
-                                else begin
-                                case(opb[2:0])
-                                        0: res <= {{size{1'b0}}, (opa )};
-                                        1: res <= {{size{1'b0}}, (opa << 1)};
-                                        2: res <= {{size{1'b0}}, (opa << 2)};
-                                        3: res <= {{size{1'b0}}, (opa << 3)};
-                                        4: res <= {{size{1'b0}}, (opa << 4)};
-                                        5: res <= {{size{1'b0}}, (opa << 5)};
-                                        6: res <= {{size{1'b0}}, (opa << 6)};
-                                        7: res <= {{size{1'b0}}, (opa << 7)};
-                                        default: res <= {{size{1'b0}}, (opa )};
-                                endcase
-                                end
-                        end
-                        else err <= 1'b1;
-                end
-                13: begin
-                        if(inp_valid == 2'b11)begin
-                                if (|opb[size-1:3]) err <= 1;
-                                else begin
-                                        case(opb[2:0])
-                                        0: res <= {{size{1'b0}}, (opa )};
-                                        1: res <= {{size{1'b0}}, (opa >> 1)};
-                                        2: res <= {{size{1'b0}}, (opa >> 2)};
-                                        3: res <= {{size{1'b0}}, (opa >> 3)};
-                                        4: res <= {{size{1'b0}}, (opa >> 4)};
-                                        5: res <= {{size{1'b0}}, (opa >> 5)};
-                                        6: res <= {{size{1'b0}}, (opa >> 6)};
-                                        7: res <= {{size{1'b0}}, (opa >> 7)};
-                                        default: res <= {{size{1'b0}}, (opa)};
-                                endcase
-                                end
-                        end
-                        else err <= 1'b1;
-                end
-                endcase
-        end
-end
 endmodule
