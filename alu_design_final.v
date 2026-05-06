@@ -16,22 +16,14 @@ reg [1:0] count;
 reg [2 * size - 1: 0] temp;
 reg [size - 1: 0] temp_opa, temp_opb;
 reg temp_err;
-
-// ─── Stage-1 intermediate registers (computed at posedge 0) ───────────────
 reg [2 * size - 1: 0] res_s1;
 reg                    err_s1, oflow_s1, g_s1, l_s1, e_s1;
-// ─────────────────────────────────────────────────────────────────────────
 
-// cout is combinational off the FINAL registered res/err
-// so it naturally reflects posedge-1 outputs with no extra work
 assign cout = (err) ? 1'b0 :
               (mode) ? ((cmd == 0 || cmd == 2) ? res[size] : 1'b0)
                      : 1'b0;
 
-// =========================================================================
-// STAGE 2 : final output registers — capture stage-1 values at posedge 1
-//           (multiply bypasses stage-1 and writes directly here)
-// =========================================================================
+
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         res          <= {2*size{1'b0}};
@@ -56,12 +48,6 @@ always @(posedge clk or posedge rst) begin
     end
 end
 
-// =========================================================================
-// STAGE 1 : compute at posedge 0, results go into _s1 registers
-//           Multiply still uses temp + count for multi-cycle result
-// =========================================================================
-
-// count logic (unchanged)
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         count <= 2'd0;
@@ -84,10 +70,7 @@ always @(posedge clk or posedge rst) begin
         temp_err        <= 0;
     end
     else if (mode) begin
-        // For multiply (cmd 9/10), do NOT apply defaults during count=0/1
-        // because err_s1 is only valid at count=2 (driven from temp_err).
-        // Applying err_s1<=0 at count=0/1 would corrupt stage-2 one cycle too early.
-        if (cmd != 9 && cmd != 10) begin
+         if (cmd != 9 && cmd != 10) begin
             err_s1   <= 1'b0;
             oflow_s1 <= 1'b0;
             {g_s1, l_s1, e_s1} <= 3'd0;
@@ -139,11 +122,6 @@ always @(posedge clk or posedge rst) begin
                 end else err_s1 <= 1'b1;
             end
 
-            // ── Multiply cmd 9: (opa+1)*(opb+1), 2-cycle latency ────────
-            // Inputs @ posedge N (count=0) → res_s1 updated @ posedge N+2 (count=2)
-            // Final res updates @ posedge N+3 via stage-2 pipeline
-            // NOTE: if you want multiply result at posedge N+2, remove stage-2
-            //       pass-through for cmd 9/10 and write directly to res in stage-1
             9: begin
                 if (count == 0) begin
                     if (inp_valid == 2'b11) begin
@@ -167,7 +145,6 @@ always @(posedge clk or posedge rst) begin
                 end
             end
 
-            // ── Multiply cmd 10: (opa<<1)*opb, 2-cycle latency ──────────
             10: begin
                 if (count == 0) begin
                     if (inp_valid == 2'b11) begin
